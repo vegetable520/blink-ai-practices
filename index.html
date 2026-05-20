@@ -1,1 +1,452 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>Blink 데이터 수집 웹앱</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #111827;
+      color: white;
+      text-align: center;
+    }
 
+    h1 {
+      font-size: 24px;
+      margin: 16px 0 6px;
+    }
+
+    p {
+      margin: 4px;
+      color: #d1d5db;
+      font-size: 14px;
+    }
+
+    #container {
+      position: relative;
+      width: 100%;
+      max-width: 480px;
+      margin: 12px auto;
+    }
+
+    video, canvas {
+      width: 100%;
+      border-radius: 16px;
+    }
+
+    canvas {
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+
+    .panel {
+      max-width: 480px;
+      margin: 12px auto;
+      padding: 16px;
+      background: #1f2937;
+      border-radius: 16px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .box {
+      background: #374151;
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .label {
+      font-size: 13px;
+      color: #d1d5db;
+    }
+
+    .value {
+      font-size: 24px;
+      font-weight: bold;
+      color: #38bdf8;
+      margin-top: 4px;
+    }
+
+    button {
+      margin: 6px;
+      padding: 12px 14px;
+      border: none;
+      border-radius: 12px;
+      font-size: 15px;
+      font-weight: bold;
+      background: #38bdf8;
+      color: #111827;
+    }
+
+    button.green {
+      background: #22c55e;
+    }
+
+    button.red {
+      background: #f87171;
+    }
+
+    button.yellow {
+      background: #facc15;
+    }
+
+    table {
+      width: 100%;
+      margin-top: 12px;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th, td {
+      border: 1px solid #4b5563;
+      padding: 6px;
+    }
+
+    th {
+      background: #374151;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>👀 Blink 데이터 수집 웹앱</h1>
+  <p>스마트폰 카메라로 눈깜빡임 특징값을 수집합니다.</p>
+
+  <button onclick="startCamera()">카메라 시작</button>
+  <button onclick="resetMeasure()" class="yellow">측정 초기화</button>
+
+  <div id="container">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <div class="panel">
+    <div class="grid">
+      <div class="box">
+        <div class="label">Blink 횟수</div>
+        <div id="blinkCount" class="value">0</div>
+      </div>
+      <div class="box">
+        <div class="label">Blink/min</div>
+        <div id="blinkPerMin" class="value">0</div>
+      </div>
+      <div class="box">
+        <div class="label">평균 눈감김 시간</div>
+        <div id="avgClose" class="value">0.00s</div>
+      </div>
+      <div class="box">
+        <div class="label">긴 눈감김 횟수</div>
+        <div id="longClose" class="value">0</div>
+      </div>
+    </div>
+
+    <p id="modeText">먼저 카메라를 시작하세요.</p>
+  </div>
+
+  <div class="panel">
+    <h3>학습 데이터 저장</h3>
+    <p>30초~1분 측정 후 현재 상태를 저장하세요.</p>
+
+    <button onclick="addData('focus')" class="green">집중 데이터 저장</button>
+    <button onclick="addData('tired')" class="red">피로 데이터 저장</button>
+    <button onclick="downloadCSV()">CSV 다운로드</button>
+    <button onclick="clearData()">데이터 삭제</button>
+
+    <table>
+      <thead>
+        <tr>
+          <th>No</th>
+          <th>Blink Count</th>
+          <th>Blink/min</th>
+          <th>Avg Close</th>
+          <th>Long Close</th>
+          <th>Closed Ratio</th>
+          <th>Label</th>
+        </tr>
+      </thead>
+      <tbody id="dataTable"></tbody>
+    </table>
+  </div>
+
+  <script type="module">
+    import {
+      FaceLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest";
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    const blinkCountEl = document.getElementById("blinkCount");
+    const blinkPerMinEl = document.getElementById("blinkPerMin");
+    const avgCloseEl = document.getElementById("avgClose");
+    const longCloseEl = document.getElementById("longClose");
+    const modeTextEl = document.getElementById("modeText");
+    const dataTableEl = document.getElementById("dataTable");
+
+    let faceLandmarker;
+
+    let blinkCount = 0;
+    let eyeClosed = false;
+    let eyeCloseStart = null;
+    let closeDurations = [];
+    let longCloseCount = 0;
+    let startTime = null;
+    let totalClosedTime = 0;
+
+    let savedData = [];
+
+    const EAR_THRESHOLD = 0.20;
+    const LONG_CLOSE_SEC = 0.40;
+
+    async function setupFaceLandmarker() {
+      const filesetResolver = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
+
+      faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+        },
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+    }
+
+    window.startCamera = async function () {
+      try {
+        if (!faceLandmarker) {
+          modeTextEl.textContent = "얼굴/눈 검출 모델을 불러오는 중입니다.";
+          await setupFaceLandmarker();
+        }
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user"
+          },
+          audio: false
+        });
+
+        video.srcObject = stream;
+
+        video.onloadeddata = () => {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          resetMeasure();
+          modeTextEl.textContent = "측정 중입니다. 얼굴을 화면 중앙에 두세요.";
+          detectLoop();
+        };
+      } catch (err) {
+        modeTextEl.textContent = "카메라 실행 실패: HTTPS 주소 또는 카메라 권한을 확인하세요.";
+        console.error(err);
+      }
+    };
+
+    function distance(p1, p2) {
+      const dx = p1.x - p2.x;
+      const dy = p1.y - p2.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    function calculateEAR(landmarks) {
+      const left = landmarks[33];
+      const right = landmarks[133];
+      const top = landmarks[159];
+      const bottom = landmarks[145];
+
+      const eyeWidth = distance(left, right);
+      const eyeHeight = distance(top, bottom);
+
+      return eyeHeight / eyeWidth;
+    }
+
+    function getCurrentFeatures() {
+      const elapsedSec = startTime ? (Date.now() - startTime) / 1000 : 0;
+      const elapsedMin = elapsedSec / 60;
+
+      const blinkPerMin = elapsedMin > 0 ? blinkCount / elapsedMin : 0;
+
+      const avgClose =
+        closeDurations.length > 0
+          ? closeDurations.reduce((a, b) => a + b, 0) / closeDurations.length
+          : 0;
+
+      const eyeClosedRatio = elapsedSec > 0 ? totalClosedTime / elapsedSec : 0;
+
+      return {
+        blink_count: blinkCount,
+        blink_per_min: Number(blinkPerMin.toFixed(2)),
+        avg_close_duration: Number(avgClose.toFixed(3)),
+        long_close_count: longCloseCount,
+        eye_closed_ratio: Number(eyeClosedRatio.toFixed(3))
+      };
+    }
+
+    function updateUI() {
+      const features = getCurrentFeatures();
+
+      blinkCountEl.textContent = blinkCount;
+      blinkPerMinEl.textContent = Math.round(features.blink_per_min);
+      avgCloseEl.textContent = features.avg_close_duration.toFixed(2) + "s";
+      longCloseEl.textContent = features.long_close_count;
+    }
+
+    async function detectLoop() {
+      const results = faceLandmarker.detectForVideo(video, performance.now());
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+        const landmarks = results.faceLandmarks[0];
+        const ear = calculateEAR(landmarks);
+
+        [33, 133, 159, 145].forEach((idx) => {
+          const p = landmarks[idx];
+          ctx.beginPath();
+          ctx.arc(p.x * canvas.width, p.y * canvas.height, 5, 0, 2 * Math.PI);
+          ctx.fillStyle = "lime";
+          ctx.fill();
+        });
+
+        const now = Date.now();
+
+        if (ear < EAR_THRESHOLD && !eyeClosed) {
+          eyeClosed = true;
+          eyeCloseStart = now;
+        }
+
+        if (ear >= EAR_THRESHOLD && eyeClosed) {
+          const durationSec = (now - eyeCloseStart) / 1000;
+          closeDurations.push(durationSec);
+          totalClosedTime += durationSec;
+
+          if (durationSec >= LONG_CLOSE_SEC) {
+            longCloseCount++;
+          }
+
+          blinkCount++;
+          eyeClosed = false;
+          eyeCloseStart = null;
+        }
+
+        updateUI();
+      }
+
+      requestAnimationFrame(detectLoop);
+    }
+
+    window.resetMeasure = function () {
+      blinkCount = 0;
+      eyeClosed = false;
+      eyeCloseStart = null;
+      closeDurations = [];
+      longCloseCount = 0;
+      totalClosedTime = 0;
+      startTime = Date.now();
+
+      blinkCountEl.textContent = "0";
+      blinkPerMinEl.textContent = "0";
+      avgCloseEl.textContent = "0.00s";
+      longCloseEl.textContent = "0";
+      modeTextEl.textContent = "측정이 초기화되었습니다.";
+    };
+
+    window.addData = function (label) {
+      const features = getCurrentFeatures();
+
+      savedData.push({
+        blink_count: features.blink_count,
+        blink_per_min: features.blink_per_min,
+        avg_close_duration: features.avg_close_duration,
+        long_close_count: features.long_close_count,
+        eye_closed_ratio: features.eye_closed_ratio,
+        label: label
+      });
+
+      renderTable();
+      resetMeasure();
+
+      modeTextEl.textContent =
+        label === "focus"
+          ? "집중 데이터가 저장되었습니다."
+          : "피로 데이터가 저장되었습니다.";
+    };
+
+    window.clearData = function () {
+      savedData = [];
+      renderTable();
+      modeTextEl.textContent = "저장된 데이터가 삭제되었습니다.";
+    };
+
+    function renderTable() {
+      dataTableEl.innerHTML = "";
+
+      savedData.forEach((item, index) => {
+        const tr = document.createElement("tr");
+
+        tr.innerHTML = `
+          <td>${index + 1}</td>
+          <td>${item.blink_count}</td>
+          <td>${item.blink_per_min}</td>
+          <td>${item.avg_close_duration}</td>
+          <td>${item.long_close_count}</td>
+          <td>${item.eye_closed_ratio}</td>
+          <td>${item.label}</td>
+        `;
+
+        dataTableEl.appendChild(tr);
+      });
+    }
+
+    window.downloadCSV = function () {
+      if (savedData.length === 0) {
+        alert("저장된 데이터가 없습니다.");
+        return;
+      }
+
+      const header = [
+        "blink_count",
+        "blink_per_min",
+        "avg_close_duration",
+        "long_close_count",
+        "eye_closed_ratio",
+        "label"
+      ];
+
+      const rows = savedData.map(item => [
+        item.blink_count,
+        item.blink_per_min,
+        item.avg_close_duration,
+        item.long_close_count,
+        item.eye_closed_ratio,
+        item.label
+      ]);
+
+      const csvContent =
+        header.join(",") + "\n" +
+        rows.map(row => row.join(",")).join("\n");
+
+      const blob = new Blob([csvContent], {
+        type: "text/csv;charset=utf-8;"
+      });
+
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+
+      link.href = url;
+      link.download = "blink_data.csv";
+      link.click();
+
+      URL.revokeObjectURL(url);
+    };
+  </script>
+</body>
+</html>
